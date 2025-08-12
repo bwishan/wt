@@ -67,9 +67,10 @@ The release system uses semantic versioning and automated GitHub Actions workflo
 
 ### Step-by-Step Release Instructions for Agents
 
-#### 0. Ensure Latest Changes are on 'develop'
+#### 0. Ensure Latest Changes are on 'develop' and no other files have been changed.
 ```bash
 git checkout develop
+git status
 git pull origin develop
 ```
 
