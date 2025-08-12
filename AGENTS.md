@@ -126,7 +126,8 @@ git push origin v[VERSION]  # e.g., git push origin v0.2.1
   - Universal zip for Windows users
   - SHA256 checksums (`checksums.txt`)
 - Creates GitHub release with auto-generated notes
-- Generates Homebrew formula as artifact
+- **Automatically updates Homebrew tap** with new version and SHA256
+- Users can immediately install/upgrade with: `brew upgrade wt`
 
 ### Release Types and When to Use Them
 
@@ -156,6 +157,14 @@ After triggering a release, agents should:
 2. Verify release appears at: `https://github.com/[USERNAME]/wt/releases`
 3. Check that all assets are present in the release
 4. Confirm checksums file is included
+5. **Verify Homebrew tap was automatically updated** (workflow will report status)
+6. If tap update fails, manual update may be needed: `./scripts/update-tap.sh [VERSION]`
+
+### Authentication Setup (Repository Owner Only)
+For automated Homebrew tap updates to work, a GitHub Personal Access Token (PAT) must be configured:
+1. Create a PAT with `repo` scope for the homebrew-wt repository
+2. Add it as `HOMEBREW_TAP_TOKEN` secret in the main wt repository settings
+3. The automated workflow will use this token to push tap updates
 
 ### Emergency Procedures
 If a release fails or has critical issues:
