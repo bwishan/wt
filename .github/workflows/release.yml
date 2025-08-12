@@ -117,10 +117,10 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   homebrew:
-    name: Update Homebrew Formula
+    name: Generate Homebrew Formula
     runs-on: ubuntu-latest
     needs: [release, build]
-    if: github.repository_owner != 'YOUR_USERNAME' # Replace with actual username
+    if: github.repository_owner == 'bwishan' # Only run for the main repository
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -149,6 +149,7 @@ jobs:
           url "https://github.com/${REPO_NAME}/releases/download/v${VERSION}/wt-${VERSION}-universal.tar.gz"
           sha256 "${SHA256}"
           version "${VERSION}"
+          license "MIT"
           
           depends_on "python@3.11"
           depends_on "git"
@@ -159,6 +160,7 @@ jobs:
           
           test do
             system "#{bin}/wt", "--version"
+            assert_match "wt ${VERSION}", shell_output("#{bin}/wt --version")
           end
         end
         EOF

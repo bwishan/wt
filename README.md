@@ -2,6 +2,8 @@
 
 A minimalist command-line interface for git worktree management, designed to work like standard git commands with subcommands and clean output formatting.
 
+**📦 Available via Homebrew:** `brew tap bwishan/wt && brew install wt`
+
 ## Overview
 
 `wt` is a CLI tool that simplifies git worktree management through an intuitive interface similar to git itself. It provides fast, reliable worktree operations with clean output and smart defaults.
@@ -152,16 +154,40 @@ NO_COLOR=1
 
 ## Installation
 
-### Homebrew (macOS) *(planned)*
+### Homebrew (macOS/Linux) - Recommended
 
 ```bash
+# Add our tap and install
+brew tap bwishan/wt
 brew install wt
+
+# Or install directly
+brew install bwishan/wt/wt
+
+# Verify installation
+wt --version
+
+# Update to latest version
+brew upgrade wt
 ```
 
-### Direct Download *(planned)*
+### Direct Download
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/user/wt/main/install.sh | sh
+# Download latest release
+curl -L -o wt-0.2.0-universal.tar.gz https://github.com/bwishan/wt/releases/download/v0.2.0/wt-0.2.0-universal.tar.gz
+
+# Extract and install
+tar -xzf wt-0.2.0-universal.tar.gz
+cd wt-0.2.0-universal
+chmod +x wt
+sudo mv wt /usr/local/bin/
+```
+
+### Using install script *(coming soon)*
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bwishan/wt/develop/install.sh | sh
 ```
 
 ### Python Package *(planned)*
@@ -248,6 +274,24 @@ Remove worktree 'feat/user-dashboard' at '_wt/feat-user-dashboard'? [y/N]: y
 ## License
 
 MIT License - see LICENSE file for details.
+
+## Distribution
+
+### Homebrew Tap
+
+wt is distributed through an official Homebrew tap:
+
+- **Tap Repository**: [homebrew-wt](https://github.com/bwishan/homebrew-wt)
+- **Formula**: Automatically updated with each release
+- **Platforms**: macOS and Linux
+
+### Release Assets
+
+Each release includes:
+- Standalone `wt` executable
+- Universal tarball (`.tar.gz`)
+- Universal zip file (Windows-friendly)
+- SHA256 checksums for verification
 
 ## Contributing
 

@@ -180,9 +180,34 @@ A successful release by an agent includes:
 - ✅ Release artifacts are generated and accessible
 - ✅ Release appears on GitHub releases page
 - ✅ Checksums match expected values
+- ✅ Homebrew tap updated (see post-release steps below)
+
+### Post-Release: Homebrew Tap Updates
+
+After successfully creating a GitHub release, agents should update the Homebrew tap:
+
+```bash
+# Update the Homebrew tap formula
+./scripts/update-tap.sh [VERSION]
+
+# Example for version 0.2.1
+./scripts/update-tap.sh 0.2.1
+```
+
+**What this does:**
+- Downloads the new release tarball
+- Calculates SHA256 checksum
+- Updates the Homebrew formula in ../homebrew-wt repository
+- Commits and pushes changes to the tap repository
+
+**Prerequisites:**
+- The homebrew-wt repository must be cloned in the parent directory
+- GitHub CLI must be authenticated
+- The release must exist on GitHub before updating the tap
 
 ### Troubleshooting Common Issues
 - **Version mismatch**: Ensure git tag version matches script version
 - **Test failures**: Fix failing tests before attempting release
 - **Build failures**: Check `build.sh` output for specific errors
 - **Permission issues**: Verify GitHub token has release permissions
+- **Tap update failures**: Ensure homebrew-wt repository is accessible and up to date
