@@ -1,88 +1,51 @@
 # Homebrew Distribution for wt
 
-This document explains how to set up and maintain the Homebrew distribution for the wt git worktree manager.
+This document explains how to maintain the Homebrew distribution for the wt git worktree manager.
 
-## Quick Installation (for users)
+## Installation (for users)
 
-Once published to Homebrew:
+wt is available through our official Homebrew tap:
 
 ```bash
-# Install from official Homebrew
-brew install wt
-
-# Or install from our tap
+# Add our tap and install
 brew tap bwishan/wt
 brew install wt
-```
 
-## Setting Up the Homebrew Tap
-
-### 1. Create Tap Repository
-
-Create a new GitHub repository named `homebrew-wt` (following Homebrew naming convention):
-
-```bash
-# The repository should be named: homebrew-wt
-# GitHub URL will be: https://github.com/bwishan/homebrew-wt
-```
-
-### 2. Initialize Tap Repository
-
-```bash
-# Clone the new repository
-git clone https://github.com/bwishan/homebrew-wt.git
-cd homebrew-wt
-
-# Create Formula directory
-mkdir Formula
-
-# Copy our formula
-cp ../wt/Formula/wt.rb Formula/
-
-# Create initial commit
-git add Formula/wt.rb
-git commit -m "Add wt formula v0.2.0"
-git push origin main
-```
-
-### 3. Test the Tap
-
-```bash
-# Add your tap locally
-brew tap bwishan/wt
-
-# Install from your tap
+# Or install directly
 brew install bwishan/wt/wt
-
-# Test the installation
-wt --version
 ```
+
+## Tap Repository
+
+- **Repository**: https://github.com/bwishan/homebrew-wt
+- **Formula**: `Formula/wt.rb`
+- **Status**: Live and functional
 
 ## Updating the Formula
 
-### Automated Updates (Recommended)
-
-The release workflow automatically generates updated Homebrew formulas. After each release:
-
-1. Download the updated formula from GitHub Actions artifacts
-2. Copy it to your `homebrew-wt` repository
-3. Commit and push the changes
-
-### Manual Updates
-
-Use the provided script to update the formula:
+Use the provided script to update the formula for new releases:
 
 ```bash
 # Update formula for new version
-./scripts/update-homebrew.sh 0.2.1
+./scripts/update-tap.sh 0.2.1
 
-# Review changes
-git diff Formula/wt.rb
+# This automatically:
+# 1. Downloads the new release tarball
+# 2. Calculates SHA256 checksum
+# 3. Updates the formula in ../homebrew-wt repository
+# 4. Commits and pushes changes
+```
 
-# Test the formula
-brew install --build-from-source Formula/wt.rb
+### Manual Process (if needed)
 
-# Commit if everything works
+If the script doesn't work, you can manually update:
+
+```bash
+# Go to the tap repository
+cd ../homebrew-wt
+
+# Edit Formula/wt.rb with new version, URL, and SHA256
+# Commit and push changes
 git add Formula/wt.rb
 git commit -m "Update wt formula to v0.2.1"
 git push origin main
@@ -100,52 +63,16 @@ Our Homebrew formula (`Formula/wt.rb`) includes:
 - **Installation**: Simple binary installation
 - **Test**: Verification that the tool works
 
-## Publishing to Official Homebrew
+## Future: Official Homebrew Core
 
-To get wt into the official Homebrew repository:
+If wt becomes widely adopted, we may consider submitting to official Homebrew:
 
-### 1. Requirements Check
-- [ ] Tool is stable and widely used
-- [ ] Has been in a tap for some time
-- [ ] No trademark issues with the name "wt"
-- [ ] Follows Homebrew guidelines
+- Requires proof of widespread usage
+- Must meet strict Homebrew core guidelines  
+- Community review process
+- Would allow `brew install wt` without adding tap
 
-### 2. Submit to homebrew-core
-
-```bash
-# Fork homebrew-core
-# Add the formula to Formula/wt.rb
-# Submit a pull request
-
-# The PR should include:
-# - Our tested formula
-# - Explanation of what wt does
-# - Why it belongs in homebrew-core
-```
-
-### 3. Maintenance
-
-Once in homebrew-core:
-- Updates go through PRs to homebrew-core
-- Community can help maintain the formula
-- Automated tools may help with updates
-
-## GitHub Actions Integration
-
-Our release workflow automatically:
-
-1. **Calculates SHA256** for the release tarball
-2. **Generates formula** with correct version and checksum
-3. **Creates artifacts** containing the updated formula
-4. **Uploads to release** for easy access
-
-To use the generated formula:
-
-1. Go to the GitHub release page
-2. Download the `homebrew-formula` artifact
-3. Extract `wt.rb` 
-4. Copy to your tap repository
-5. Commit and push
+For now, our tap provides all the benefits with full control.
 
 ## Testing Formula Changes
 
