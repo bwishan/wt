@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-08-12
+
 ### Added
 - GitHub Actions CI/CD workflows for testing and releases
 - Automated build system with `build.sh` script
