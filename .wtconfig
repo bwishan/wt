@@ -1,0 +1,3 @@
+[wt]
+base_ref = origin/main
+worktree_dir_prefix = _wt/
