@@ -67,6 +67,12 @@ The release system uses semantic versioning and automated GitHub Actions workflo
 
 ### Step-by-Step Release Instructions for Agents
 
+#### 0. Ensure Latest Changes are on 'develop'
+```bash
+git checkout develop
+git pull origin develop
+```
+
 #### 1. Pre-Release Validation
 Before creating any release, agents MUST:
 ```bash
