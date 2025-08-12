@@ -48,6 +48,7 @@ Prerequisites:
 - Must be run from wt project root
 - Git must be configured with push access to homebrew-wt repo
 - curl must be available
+- For automated runs: HOMEBREW_TAP_TOKEN environment variable with repo access
 
 Examples:
     $0 0.2.1    # Update tap to version 0.2.1
@@ -84,8 +85,22 @@ update_tap_formula() {
     
     # Clone the tap repository
     log "Cloning tap repository..."
-    if ! git clone "https://github.com/$repo_owner/$tap_repo.git" "$tap_dir"; then
+    local clone_url
+    if [ -n "${HOMEBREW_TAP_TOKEN:-}" ]; then
+        # Use token authentication for CI/automated environments
+        clone_url="https://$HOMEBREW_TAP_TOKEN@github.com/$repo_owner/$tap_repo.git"
+        log "Using token authentication for repository access"
+    else
+        # Use standard HTTPS for manual runs (assumes user has push access)
+        clone_url="https://github.com/$repo_owner/$tap_repo.git"
+        log "Using standard authentication (requires push access)"
+    fi
+    
+    if ! git clone "$clone_url" "$tap_dir"; then
         error "Failed to clone tap repository"
+        if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            error "For automated runs, set HOMEBREW_TAP_TOKEN environment variable"
+        fi
         exit 1
     fi
     
