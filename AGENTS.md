@@ -5,6 +5,8 @@ For detailed project specifications, command structure, and feature descriptions
 
 ## Project Infrastructure & Deployment
 
+- Do not commit directly to develop. Only commit when you've been asked to or when you've been given permission. Commits should always be in a feature branch.
+
 ### Platform & Hosting
 - **Repository**: Hosted on GitHub
 - **CI/CD**: Fully implemented with GitHub Actions
