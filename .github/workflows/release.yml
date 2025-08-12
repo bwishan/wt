@@ -1,0 +1,191 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Configure Git
+      run: |
+        git config --global user.name "CI Test User"
+        git config --global user.email "ci@example.com"
+
+    - name: Make wt executable
+      run: chmod +x ./wt
+
+    - name: Run tests
+      run: python3 test_wt.py ./wt
+
+  build:
+    name: Build Release Assets
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Get version from tag
+      id: get_version
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/v}
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: $VERSION"
+
+    - name: Verify version matches script
+      run: |
+        SCRIPT_VERSION=$(grep '__version__ = ' wt | sed 's/__version__ = "\(.*\)"/\1/')
+        TAG_VERSION="${{ steps.get_version.outputs.version }}"
+        echo "Script version: $SCRIPT_VERSION"
+        echo "Tag version: $TAG_VERSION"
+        if [ "$SCRIPT_VERSION" != "$TAG_VERSION" ]; then
+          echo "❌ Version mismatch: script has $SCRIPT_VERSION but tag is $TAG_VERSION"
+          exit 1
+        fi
+        echo "✅ Version verified: $TAG_VERSION"
+
+    - name: Configure Git for build
+      run: |
+        git config --global user.name "Release Bot"
+        git config --global user.email "release@example.com"
+
+    - name: Build release assets
+      run: ./build.sh
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-assets
+        path: dist/
+        retention-days: 30
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: release-assets
+        path: dist/
+
+    - name: Prepare release files
+      run: |
+        ls -la dist/
+        echo "Release files prepared"
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        name: "wt v${{ needs.build.outputs.version }}"
+        body_path: dist/release-notes.md
+        draft: false
+        prerelease: false
+        files: |
+          dist/wt
+          dist/wt-${{ needs.build.outputs.version }}-universal.tar.gz
+          dist/wt-${{ needs.build.outputs.version }}-universal.zip
+          dist/checksums.txt
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew:
+    name: Update Homebrew Formula
+    runs-on: ubuntu-latest
+    needs: [release, build]
+    if: github.repository_owner != 'YOUR_USERNAME' # Replace with actual username
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Calculate SHA256 for Homebrew
+      id: sha256
+      run: |
+        VERSION="${{ needs.build.outputs.version }}"
+        URL="https://github.com/${{ github.repository }}/releases/download/v${VERSION}/wt-${VERSION}-universal.tar.gz"
+        SHA256=$(curl -sL "$URL" | sha256sum | cut -d' ' -f1)
+        echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+        echo "URL: $URL"
+        echo "SHA256: $SHA256"
+
+    - name: Create Homebrew Formula
+      run: |
+        VERSION="${{ needs.build.outputs.version }}"
+        SHA256="${{ steps.sha256.outputs.sha256 }}"
+        REPO_NAME="${{ github.repository }}"
+        
+        mkdir -p homebrew-formula
+        cat > homebrew-formula/wt.rb << EOF
+        class Wt < Formula
+          desc "Git Worktree Manager - A minimalist CLI for managing git worktrees"
+          homepage "https://github.com/${REPO_NAME}"
+          url "https://github.com/${REPO_NAME}/releases/download/v${VERSION}/wt-${VERSION}-universal.tar.gz"
+          sha256 "${SHA256}"
+          version "${VERSION}"
+          
+          depends_on "python@3.11"
+          depends_on "git"
+          
+          def install
+            bin.install "wt"
+          end
+          
+          test do
+            system "#{bin}/wt", "--version"
+          end
+        end
+        EOF
+        
+        echo "Generated Homebrew formula:"
+        cat homebrew-formula/wt.rb
+
+    - name: Upload Homebrew Formula
+      uses: actions/upload-artifact@v4
+      with:
+        name: homebrew-formula
+        path: homebrew-formula/
+        retention-days: 90
+
+  notify:
+    name: Post-Release Notifications
+    runs-on: ubuntu-latest
+    needs: [release, build]
+    if: always() && needs.release.result == 'success'
+    steps:
+    - name: Release Summary
+      run: |
+        echo "🎉 Successfully released wt v${{ needs.build.outputs.version }}"
+        echo "📦 Release URL: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build.outputs.version }}"
+        echo "🍺 Homebrew formula available in artifacts"
+        echo ""
+        echo "Next steps:"
+        echo "1. Update documentation if needed"
+        echo "2. Submit Homebrew formula to tap repository"
+        echo "3. Announce release in relevant channels"

@@ -1,0 +1,1 @@
+Please review AGENTS.md for instructions on coding in this project using an agent.  When you read it, be sure to tell the user you did so that they know you had the correct context when making changes.

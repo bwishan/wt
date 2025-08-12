@@ -1,0 +1,860 @@
+#!/usr/bin/env python3
+"""
+wt - Git Worktree Manager
+A minimalist CLI for managing git worktrees with clean output and color support.
+"""
+
+import argparse
+import asyncio
+import configparser
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+__version__ = "0.2.0"
+
+
+# Color handling
+class Colors:
+    """ANSI color codes and utilities."""
+    
+    # Colors
+    RED = '\033[31m'
+    GREEN = '\033[32m'
+    YELLOW = '\033[33m'
+    BLUE = '\033[34m'
+    MAGENTA = '\033[35m'
+    CYAN = '\033[36m'
+    WHITE = '\033[37m'
+    DIM = '\033[2m'
+    BOLD = '\033[1m'
+    RESET = '\033[0m'
+    
+    # Status symbols
+    SUCCESS = '✓'
+    ERROR = '✗'
+    WARNING = '⚠'
+    AHEAD = '↑'
+    BEHIND = '↓'
+    
+    _enabled = None
+    
+    @classmethod
+    def enabled(cls) -> bool:
+        """Check if colors should be enabled."""
+        if cls._enabled is None:
+            # Check environment variables
+            if os.getenv('NO_COLOR') or os.getenv('CLICOLOR') == '0':
+                cls._enabled = False
+            elif os.getenv('FORCE_COLOR') or os.getenv('WT_COLOR') == 'always':
+                cls._enabled = True
+            elif os.getenv('WT_COLOR') == 'never':
+                cls._enabled = False
+            else:
+                # Auto-detect: enabled if stdout is a tty
+                cls._enabled = sys.stdout.isatty()
+        return cls._enabled
+    
+    @classmethod
+    def colorize(cls, text: str, color: str) -> str:
+        """Apply color to text if colors are enabled."""
+        if not cls.enabled():
+            return text
+        return f"{color}{text}{cls.RESET}"
+    
+    @classmethod
+    def success(cls, text: str) -> str:
+        return cls.colorize(f"{cls.SUCCESS} {text}", cls.GREEN)
+    
+    @classmethod
+    def error(cls, text: str) -> str:
+        return cls.colorize(f"{cls.ERROR} {text}", cls.RED)
+    
+    @classmethod
+    def warning(cls, text: str) -> str:
+        return cls.colorize(f"{cls.WARNING} {text}", cls.YELLOW)
+    
+    @classmethod
+    def ahead(cls, count: int) -> str:
+        return cls.colorize(f"{cls.AHEAD}{count} ahead", cls.GREEN)
+    
+    @classmethod
+    def behind(cls, count: int) -> str:
+        return cls.colorize(f"{cls.BEHIND}{count} behind", cls.BLUE)
+    
+    @classmethod
+    def dirty(cls) -> str:
+        return cls.colorize("dirty", cls.YELLOW)
+    
+    @classmethod
+    def locked(cls) -> str:
+        return cls.colorize("locked", cls.RED)
+    
+    @classmethod
+    def prunable(cls) -> str:
+        return cls.colorize("prunable", cls.DIM)
+    
+    @classmethod
+    def dim(cls, text: str) -> str:
+        return cls.colorize(text, cls.DIM)
+
+
+@dataclass
+class Worktree:
+    """Represents a git worktree."""
+    path: str
+    branch: Optional[str]
+    head: str
+    locked: bool = False
+    prunable: bool = False
+    reason: Optional[str] = None
+
+
+class Config:
+    """Configuration management for wt."""
+    
+    def __init__(self, repo_root: str):
+        self.repo_root = repo_root
+        self.base_ref = "origin/main"
+        self.worktree_dir_prefix = "_wt/"
+        self.auto_name_directories = True
+        self.name_transform = "slash_to_dash"
+        self.conflict_strategy = "auto_suffix"
+        self._load_config()
+    
+    def _load_config(self):
+        """Load configuration from file and environment variables."""
+        config_path = Path(self.repo_root) / ".wtconfig"
+        
+        if config_path.exists():
+            try:
+                config = configparser.ConfigParser()
+                config.read(config_path)
+                
+                if "wt" in config:
+                    section = config["wt"]
+                    self.base_ref = section.get("base_ref", self.base_ref)
+                    self.worktree_dir_prefix = section.get("worktree_dir_prefix", self.worktree_dir_prefix)
+                    self.auto_name_directories = section.getboolean("auto_name_directories", self.auto_name_directories)
+                    self.name_transform = section.get("name_transform", self.name_transform)
+                    self.conflict_strategy = section.get("conflict_strategy", self.conflict_strategy)
+            except Exception:
+                pass
+        
+        # Environment variable overrides
+        self.base_ref = os.environ.get("WT_BASE_REF", self.base_ref)
+        self.worktree_dir_prefix = os.environ.get("WT_DIR_PREFIX", self.worktree_dir_prefix)
+    
+    def generate_directory_name(self, branch_name: str) -> str:
+        """Generate directory name from branch name based on configuration."""
+        if not self.auto_name_directories:
+            return ""
+        
+        # Apply name transformation
+        if self.name_transform == "slash_to_dash":
+            dir_name = branch_name.replace("/", "-")
+        elif self.name_transform == "underscore":
+            dir_name = branch_name.replace("/", "_")
+        elif self.name_transform == "sanitize":
+            # Replace all non-alphanumeric characters with dashes
+            dir_name = re.sub(r'[^a-zA-Z0-9]+', '-', branch_name)
+        else:
+            dir_name = branch_name.replace("/", "-")  # Default fallback
+        
+        # Remove leading/trailing dashes and collapse multiple dashes
+        dir_name = re.sub(r'-+', '-', dir_name).strip('-')
+        
+        return f"{self.worktree_dir_prefix}{dir_name}"
+    
+    def resolve_directory_conflict(self, base_path: str, repo_root: str) -> str:
+        """Resolve directory naming conflicts."""
+        full_path = Path(repo_root) / base_path
+        
+        if not full_path.exists():
+            return base_path
+        
+        if self.conflict_strategy == "auto_suffix":
+            counter = 2
+            while True:
+                new_path = f"{base_path}-{counter}"
+                if not (Path(repo_root) / new_path).exists():
+                    return new_path
+                counter += 1
+        elif self.conflict_strategy == "fail":
+            raise Exception(f"Directory {base_path} already exists")
+        
+        return base_path  # Fallback
+
+
+class GitManager:
+    """Handles git operations via subprocess."""
+    
+    def __init__(self, repo_root: str, config: Config):
+        self.repo_root = repo_root
+        self.config = config
+    
+    async def run_git(self, *args: str, cwd: Optional[str] = None) -> Tuple[int, str, str]:
+        """Run a git command and return (returncode, stdout, stderr)."""
+        if cwd is None:
+            cwd = self.repo_root
+        
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", *args,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            return proc.returncode, stdout.decode(), stderr.decode()
+        except FileNotFoundError:
+            return 1, "", "git not found in PATH"
+    
+    async def list_worktrees(self) -> List[Worktree]:
+        """List all worktrees in the repository."""
+        code, out, err = await self.run_git("worktree", "list", "--porcelain")
+        if code != 0:
+            raise Exception(f"Failed to list worktrees: {err}")
+        
+        worktrees = []
+        current_wt = {}
+        
+        for line in out.strip().split("\n"):
+            if not line:
+                if current_wt:
+                    worktrees.append(self._parse_worktree(current_wt))
+                    current_wt = {}
+                continue
+            
+            if line.startswith("worktree "):
+                current_wt["path"] = line[9:]
+            elif line.startswith("HEAD "):
+                current_wt["head"] = line[5:]
+            elif line.startswith("branch "):
+                current_wt["branch"] = line[7:]
+            elif line == "locked":
+                current_wt["locked"] = True
+            elif line == "prunable":
+                current_wt["prunable"] = True
+            elif line.startswith("locked "):
+                current_wt["locked"] = True
+                current_wt["reason"] = line[7:]
+        
+        if current_wt:
+            worktrees.append(self._parse_worktree(current_wt))
+        
+        return worktrees
+    
+    def _parse_worktree(self, data: dict) -> Worktree:
+        """Parse worktree data into a Worktree object."""
+        # Clean up branch name - remove refs/heads/ prefix
+        branch = data.get("branch")
+        if branch and branch.startswith("refs/heads/"):
+            branch = branch[11:]  # Remove "refs/heads/" prefix
+        
+        return Worktree(
+            path=data.get("path", ""),
+            branch=branch,
+            head=data.get("head", "")[:8],
+            locked=data.get("locked", False),
+            prunable=data.get("prunable", False),
+            reason=data.get("reason")
+        )
+    
+    async def create_worktree(self, directory: str, branch: str, base_ref: str) -> Tuple[bool, str]:
+        """Create a new worktree with automatic directory naming."""
+        if not directory:
+            directory = self.config.generate_directory_name(branch)
+            directory = self.config.resolve_directory_conflict(directory, self.repo_root)
+        
+        full_path = Path(self.repo_root) / directory
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        code, out, err = await self.run_git(
+            "worktree", "add", str(full_path), base_ref, "-b", branch
+        )
+        
+        if code == 0:
+            return True, f"Created worktree {branch} at {directory}"
+        else:
+            return False, err
+    
+    async def remove_worktree(self, path: str, force: bool = False) -> Tuple[bool, str]:
+        """Remove a worktree."""
+        args = ["worktree", "remove"]
+        if force:
+            args.append("--force")
+        args.append(path)
+        
+        code, out, err = await self.run_git(*args)
+        return code == 0, err if code != 0 else f"Removed worktree {path}"
+    
+    async def prune_worktrees(self) -> Tuple[bool, str]:
+        """Prune stray worktrees."""
+        code, out, err = await self.run_git("worktree", "prune")
+        return code == 0, err if code != 0 else "Pruned worktrees"
+    
+    async def sync_worktrees(self) -> Tuple[bool, str]:
+        """Sync all worktrees (fetch)."""
+        code, out, err = await self.run_git("fetch", "--all", "--prune")
+        return code == 0, err if code != 0 else "Synced worktrees"
+    
+    async def detect_base_branch(self) -> str:
+        """Detect the base branch for the repository."""
+        for branch in ["origin/main", "origin/master", "origin/develop", "main", "master", "develop"]:
+            code, _, _ = await self.run_git("rev-parse", "--verify", branch)
+            if code == 0:
+                return branch
+        return "HEAD"
+    
+    async def check_uncommitted_changes(self, worktree_path: str) -> Tuple[bool, List[str]]:
+        """Check for uncommitted changes in a worktree.
+        
+        Returns:
+            Tuple of (has_changes, list_of_change_descriptions)
+        """
+        if not Path(worktree_path).exists():
+            return False, []
+        
+        changes = []
+        
+        # Check for staged changes
+        code, out, _ = await self.run_git("diff", "--cached", "--name-only", cwd=worktree_path)
+        if code == 0 and out.strip():
+            staged_files = out.strip().split('\n')
+            changes.append(f"{len(staged_files)} staged file(s): {', '.join(staged_files[:3])}{'...' if len(staged_files) > 3 else ''}")
+        
+        # Check for unstaged changes
+        code, out, _ = await self.run_git("diff", "--name-only", cwd=worktree_path)
+        if code == 0 and out.strip():
+            unstaged_files = out.strip().split('\n')
+            changes.append(f"{len(unstaged_files)} unstaged file(s): {', '.join(unstaged_files[:3])}{'...' if len(unstaged_files) > 3 else ''}")
+        
+        # Check for untracked files
+        code, out, _ = await self.run_git("ls-files", "--others", "--exclude-standard", cwd=worktree_path)
+        if code == 0 and out.strip():
+            untracked_files = out.strip().split('\n')
+            changes.append(f"{len(untracked_files)} untracked file(s): {', '.join(untracked_files[:3])}{'...' if len(untracked_files) > 3 else ''}")
+        
+        return len(changes) > 0, changes
+    
+    async def check_git_state(self, worktree_path: str) -> Tuple[bool, List[str]]:
+        """Check for ongoing git operations (rebase, merge, etc.) in a worktree.
+        
+        Returns:
+            Tuple of (has_ongoing_operations, list_of_operation_descriptions)
+        """
+        if not Path(worktree_path).exists():
+            return False, []
+        
+        git_file = Path(worktree_path) / ".git"
+        
+        # In worktrees, .git is a file pointing to the actual git directory
+        if git_file.is_file():
+            try:
+                git_content = git_file.read_text().strip()
+                if git_content.startswith("gitdir: "):
+                    git_dir = Path(git_content[8:])  # Remove "gitdir: " prefix
+                else:
+                    return False, []
+            except Exception:
+                return False, []
+        else:
+            git_dir = git_file
+        
+        operations = []
+        
+        # Check for rebase in progress
+        if (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists():
+            operations.append("rebase in progress")
+        
+        # Check for merge in progress
+        if (git_dir / "MERGE_HEAD").exists():
+            operations.append("merge in progress")
+        
+        # Check for cherry-pick in progress
+        if (git_dir / "CHERRY_PICK_HEAD").exists():
+            operations.append("cherry-pick in progress")
+        
+        # Check for revert in progress
+        if (git_dir / "REVERT_HEAD").exists():
+            operations.append("revert in progress")
+        
+        return len(operations) > 0, operations
+
+
+# Utility functions for interactive input
+
+def prompt_input(prompt: str, default: str = "") -> str:
+    """Prompt for user input with optional default value."""
+    if default:
+        display_prompt = f"{prompt} [{Colors.dim(default)}]: "
+    else:
+        display_prompt = f"{prompt}: "
+    
+    try:
+        response = input(display_prompt).strip()
+        return response if response else default
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled by user.")
+        sys.exit(130)
+
+
+def validate_branch_name(branch_name: str) -> Tuple[bool, List[str]]:
+    """Validate branch name and return suggestions if invalid."""
+    if not branch_name:
+        return False, ["Feature branches: feat/feature-name", "Fix branches: fix/issue-name", "Hotfixes: hotfix/critical-fix"]
+    
+    # Check for invalid patterns
+    suggestions = []
+    
+    if "//" in branch_name:
+        suggestions.append(branch_name.replace("//", "/"))
+        suggestions.append(branch_name.replace("//", "-"))
+        return False, suggestions
+    
+    if branch_name.startswith("/") or branch_name.endswith("/"):
+        clean_name = branch_name.strip("/")
+        suggestions.append(clean_name)
+        suggestions.append(f"feat/{clean_name}")
+        return False, suggestions
+    
+    # Check for problematic characters
+    if re.search(r'[^a-zA-Z0-9/_-]', branch_name):
+        clean_name = re.sub(r'[^a-zA-Z0-9/_-]', '-', branch_name)
+        suggestions.append(clean_name)
+        return False, suggestions
+    
+    return True, []
+
+
+async def select_worktree_interactive(git: GitManager, exclude_main: bool = True) -> Optional[Worktree]:
+    """Interactive worktree selection with numbered menu."""
+    worktrees = await git.list_worktrees()
+    
+    if exclude_main:
+        # Filter out main worktree (current repo root)
+        selectable = [wt for wt in worktrees if wt.path != git.repo_root]
+    else:
+        selectable = worktrees
+    
+    if not selectable:
+        print(Colors.error("No worktrees available for selection"))
+        return None
+    
+    print("Select worktree:")
+    for i, wt in enumerate(selectable, 1):
+        branch = wt.branch or "(detached)"
+        path_display = wt.path.replace(git.repo_root, "").lstrip("/")
+        if not path_display:
+            path_display = "."
+        print(f"  {i}. {branch} ({path_display})")
+    
+    try:
+        while True:
+            choice = input(f"Choice [1-{len(selectable)}]: ").strip()
+            
+            if not choice:
+                continue
+                
+            try:
+                index = int(choice) - 1
+                if 0 <= index < len(selectable):
+                    return selectable[index]
+                else:
+                    print(Colors.error(f"Please enter a number between 1 and {len(selectable)}"))
+            except ValueError:
+                print(Colors.error("Please enter a valid number"))
+                
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled by user.")
+        return None
+
+
+# CLI Commands
+
+async def cmd_list(git: GitManager, args) -> int:
+    """List all worktrees in a clean table format."""
+    try:
+        worktrees = await git.list_worktrees()
+        
+        if not worktrees:
+            print("No worktrees found.")
+            return 0
+        
+        # Calculate column widths for alignment
+        max_branch_len = max(len(wt.branch or "(detached)") for wt in worktrees)
+        max_path_len = max(len(wt.path.replace(git.repo_root, "").lstrip("/") or ".") for wt in worktrees)
+        
+        # Ensure minimum widths
+        branch_width = max(max_branch_len, 15)
+        path_width = max(max_path_len, 10)
+        
+        # Header
+        print(f"{'BRANCH':<{branch_width}} {'PATH':<{path_width}} {'HEAD':<8} {'STATUS'}")
+        print("─" * (branch_width + path_width + 20))
+        
+        # Worktree rows
+        for wt in worktrees:
+            branch = wt.branch or "(detached)"
+            path_display = wt.path.replace(git.repo_root, "").lstrip("/")
+            if not path_display:
+                path_display = "."
+            
+            head = Colors.dim(wt.head[:8]) if wt.head else ""
+            
+            # Status indicators
+            status_parts = []
+            if wt.locked:
+                status_parts.append(Colors.locked())
+            if wt.prunable:
+                status_parts.append(Colors.prunable())
+            # TODO: Add ahead/behind detection
+            
+            status = " ".join(status_parts)
+            
+            print(f"{branch:<{branch_width}} {path_display:<{path_width}} {head:<8} {status}")
+        
+        return 0
+        
+    except Exception as e:
+        print(Colors.error(f"Error listing worktrees: {e}"), file=sys.stderr)
+        return 1
+
+
+async def cmd_new(git: GitManager, args) -> int:
+    """Create a new worktree with the specified branch."""
+    try:
+        branch_name = getattr(args, 'branch', None)
+        directory = getattr(args, 'dir', None)
+        base_ref = getattr(args, 'base', None) or git.config.base_ref
+        
+        # Interactive prompting for missing branch name
+        if not branch_name:
+            print("Creating new worktree...")
+            while True:
+                branch_name = prompt_input("Branch name")
+                if not branch_name:
+                    print(Colors.error("Branch name is required"))
+                    continue
+                
+                # Validate branch name
+                valid, suggestions = validate_branch_name(branch_name)
+                if valid:
+                    break
+                else:
+                    print(Colors.error(f"Invalid branch name '{branch_name}'"))
+                    if suggestions:
+                        print("Suggestions:")
+                        for suggestion in suggestions[:3]:  # Show max 3 suggestions
+                            print(f"  • {Colors.colorize(suggestion, Colors.CYAN)}")
+                        print()
+        
+        # Use provided directory or auto-generate
+        if not directory:
+            directory = git.config.generate_directory_name(branch_name)
+            directory = git.config.resolve_directory_conflict(directory, git.repo_root)
+            
+            # Only prompt for directory if we had to prompt for branch name
+            if not getattr(args, 'branch', None):
+                directory = prompt_input("Directory", directory)
+        
+        # Only prompt for base ref if we had to prompt for branch name and no base was provided
+        if not getattr(args, 'base', None) and not getattr(args, 'branch', None):
+            base_ref = prompt_input("Base ref", base_ref)
+        
+        print(f"Creating worktree '{branch_name}' at '{directory}' from '{base_ref}'...")
+        
+        success, message = await git.create_worktree(directory, branch_name, base_ref)
+        
+        if success:
+            print(Colors.success(message))
+            return 0
+        else:
+            print(Colors.error(message), file=sys.stderr)
+            return 1
+            
+    except Exception as e:
+        print(Colors.error(f"Error creating worktree: {e}"), file=sys.stderr)
+        return 1
+
+
+async def cmd_rm(git: GitManager, args) -> int:
+    """Remove a worktree by branch name."""
+    try:
+        branch_name = getattr(args, 'branch', None)
+        force = getattr(args, 'force', False)
+        yes = getattr(args, 'yes', False)
+        target_wt = None
+        
+        # Interactive selection if no branch name provided
+        if not branch_name:
+            target_wt = await select_worktree_interactive(git, exclude_main=True)
+            if not target_wt:
+                return 1
+        else:
+            # Find worktree by branch name with flexible matching
+            worktrees = await git.list_worktrees()
+            possible_matches = []
+            
+            for wt in worktrees:
+                if not wt.branch:
+                    continue
+                    
+                # Exact match
+                if wt.branch == branch_name:
+                    target_wt = wt
+                    break
+                    
+                # Suffix match (e.g., "feature" matches "feat/feature")
+                if wt.branch.endswith(f"/{branch_name}"):
+                    if wt not in possible_matches:
+                        possible_matches.append(wt)
+                    
+                # Partial match anywhere in branch name (only if not already matched above)
+                elif branch_name in wt.branch:
+                    if wt not in possible_matches:
+                        possible_matches.append(wt)
+            
+            # If no exact match but we have possible matches
+            if not target_wt and possible_matches:
+                if len(possible_matches) == 1:
+                    target_wt = possible_matches[0]
+                else:
+                    # Multiple matches - show selection
+                    print(f"Multiple branches match '{branch_name}':")
+                    for i, wt in enumerate(possible_matches, 1):
+                        path_display = wt.path.replace(git.repo_root, "").lstrip("/")
+                        if not path_display:
+                            path_display = "."
+                        print(f"  {i}. {wt.branch} ({path_display})")
+                    
+                    try:
+                        while True:
+                            choice = input(f"Choice [1-{len(possible_matches)}]: ").strip()
+                            if not choice:
+                                continue
+                            try:
+                                index = int(choice) - 1
+                                if 0 <= index < len(possible_matches):
+                                    target_wt = possible_matches[index]
+                                    break
+                                else:
+                                    print(Colors.error(f"Please enter a number between 1 and {len(possible_matches)}"))
+                            except ValueError:
+                                print(Colors.error("Please enter a valid number"))
+                    except (KeyboardInterrupt, EOFError):
+                        print("\nCancelled by user.")
+                        return 130
+            
+            if not target_wt:
+                print(Colors.error(f"Worktree with branch '{branch_name}' not found"), file=sys.stderr)
+                return 1
+        
+        # Can't remove the main worktree
+        if target_wt.path == git.repo_root:
+            print(Colors.error("Cannot remove main worktree"), file=sys.stderr)
+            return 1
+        
+        # Get branch name for display
+        display_branch = target_wt.branch or "(detached)"
+        path_display = target_wt.path.replace(git.repo_root, "").lstrip("/")
+        
+        # Safety checks (unless forced)
+        if not force:
+            # Check for uncommitted changes
+            has_changes, change_descriptions = await git.check_uncommitted_changes(target_wt.path)
+            if has_changes:
+                print(Colors.warning(f"Worktree '{display_branch}' contains uncommitted changes that will be lost:"))
+                for desc in change_descriptions:
+                    print(f"  • {desc}")
+                print()
+                print("To proceed anyway, use --force to skip safety checks")
+                print("Or commit/stash your changes first")
+                return 1
+            
+            # Check for ongoing git operations
+            has_operations, operation_descriptions = await git.check_git_state(target_wt.path)
+            if has_operations:
+                print(Colors.warning(f"Worktree '{display_branch}' has ongoing git operations:"))
+                for desc in operation_descriptions:
+                    print(f"  • {desc}")
+                print()
+                print("Complete or abort these operations first, or use --force to skip safety checks")
+                return 1
+        
+        # Confirm removal unless --yes was specified
+        if not yes:
+            try:
+                response = input(f"Remove worktree '{display_branch}' at '{path_display}'? [y/N]: ")
+                if response.lower() not in ('y', 'yes'):
+                    print("Cancelled.")
+                    return 0
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled by user.")
+                return 130
+        
+        success, message = await git.remove_worktree(target_wt.path, force)
+        
+        if success:
+            print(Colors.success(message))
+            return 0
+        else:
+            print(Colors.error(message), file=sys.stderr)
+            return 1
+            
+    except Exception as e:
+        print(Colors.error(f"Error removing worktree: {e}"), file=sys.stderr)
+        return 1
+
+
+async def cmd_sync(git: GitManager, args) -> int:
+    """Sync all worktrees with remote."""
+    try:
+        print("Syncing worktrees...")
+        success, message = await git.sync_worktrees()
+        
+        if success:
+            print(Colors.success(message))
+            return 0
+        else:
+            print(Colors.error(message), file=sys.stderr)
+            return 1
+            
+    except Exception as e:
+        print(Colors.error(f"Error syncing worktrees: {e}"), file=sys.stderr)
+        return 1
+
+
+async def cmd_prune(git: GitManager, args) -> int:
+    """Prune stale worktree administrative files."""
+    try:
+        print("Pruning worktrees...")
+        success, message = await git.prune_worktrees()
+        
+        if success:
+            print(Colors.success(message))
+            return 0
+        else:
+            print(Colors.error(message), file=sys.stderr)
+            return 1
+            
+    except Exception as e:
+        print(Colors.error(f"Error pruning worktrees: {e}"), file=sys.stderr)
+        return 1
+
+
+def find_repo_root(path: str = ".") -> Optional[str]:
+    """Find the git repository root."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def create_parser() -> argparse.ArgumentParser:
+    """Create the argument parser with subcommands."""
+    parser = argparse.ArgumentParser(
+        prog='wt',
+        description='Minimalist git worktree manager',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  wt list                    List all worktrees
+  wt new feat/dashboard      Create new worktree for feature branch
+  wt rm feat/dashboard       Remove worktree
+  wt sync                    Sync all worktrees with remote
+        """
+    )
+    
+    parser.add_argument('--version', action='version', version=f'wt {__version__}')
+    
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    # wt list (with ls alias)
+    list_parser = subparsers.add_parser('list', aliases=['ls'], help='List worktrees')
+    list_parser.add_argument('--porcelain', action='store_true', help='Script-friendly output')
+    
+    # wt new
+    new_parser = subparsers.add_parser('new', help='Create new worktree')
+    new_parser.add_argument('branch', nargs='?', help='Branch name (will prompt if not provided)')
+    new_parser.add_argument('--base', help='Base branch/commit (default: origin/main)')
+    new_parser.add_argument('--dir', help='Custom directory path')
+    new_parser.add_argument('--force', '-f', action='store_true', help='Force creation')
+    
+    # wt rm
+    rm_parser = subparsers.add_parser('rm', help='Remove worktree')
+    rm_parser.add_argument('branch', nargs='?', help='Branch name to remove (will prompt if not provided)')
+    rm_parser.add_argument('--force', '-f', action='store_true', help='Skip safety checks (allow data loss)')
+    rm_parser.add_argument('--yes', '-y', action='store_true', help='Skip confirmation prompts')
+    
+    # wt sync
+    sync_parser = subparsers.add_parser('sync', help='Sync worktrees with remote')
+    
+    # wt prune
+    prune_parser = subparsers.add_parser('prune', help='Prune stale worktree entries')
+    
+    return parser
+
+
+async def main():
+    """Main entry point."""
+    parser = create_parser()
+    args = parser.parse_args()
+    
+    # Check for git availability
+    if shutil.which("git") is None:
+        print(Colors.error("git not found in PATH"), file=sys.stderr)
+        return 1
+    
+    # Find repository root
+    repo_root = find_repo_root(".")
+    if repo_root is None:
+        print(Colors.error("not inside a git repository"), file=sys.stderr)
+        return 1
+    
+    # Initialize managers
+    config = Config(repo_root)
+    git = GitManager(repo_root, config)
+    
+    # Detect base branch
+    config.base_ref = await git.detect_base_branch()
+    
+    # Handle commands
+    if args.command is None or args.command in ('list', 'ls'):
+        return await cmd_list(git, args)
+    elif args.command == 'new':
+        return await cmd_new(git, args)
+    elif args.command == 'rm':
+        return await cmd_rm(git, args)
+    elif args.command == 'sync':
+        return await cmd_sync(git, args)
+    elif args.command == 'prune':
+        return await cmd_prune(git, args)
+    else:
+        parser.print_help()
+        return 1
+
+
+if __name__ == "__main__":
+    try:
+        exit_code = asyncio.run(main())
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(Colors.error(f"Unexpected error: {e}"), file=sys.stderr)
+        sys.exit(1)
