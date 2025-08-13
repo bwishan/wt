@@ -312,6 +312,103 @@ class GitManager:
                 return branch
         return "HEAD"
     
+    async def get_current_branch(self) -> Optional[str]:
+        """Get the current branch name."""
+        code, out, _ = await self.run_git("rev-parse", "--abbrev-ref", "HEAD")
+        if code == 0:
+            branch = out.strip()
+            return branch if branch != "HEAD" else None
+        return None
+    
+    async def sync_branch_from_remote(self, source_branch: str, use_rebase: bool = False, force: bool = False) -> Tuple[bool, str]:
+        """Sync current branch from a source branch (merge or rebase)."""
+        current_branch = await self.get_current_branch()
+        if not current_branch:
+            return False, "Not on a branch (detached HEAD)"
+        
+        # First, fetch the latest changes
+        code, _, err = await self.run_git("fetch", "--all", "--prune")
+        if code != 0:
+            return False, f"Failed to fetch: {err}"
+        
+        # Verify source branch exists
+        code, _, _ = await self.run_git("rev-parse", "--verify", source_branch)
+        if code != 0:
+            return False, f"Source branch '{source_branch}' not found"
+        
+        # Perform the sync operation
+        if use_rebase:
+            return await self.rebase_branch(source_branch, force)
+        else:
+            return await self.merge_branch(source_branch, force)
+    
+    async def rebase_branch(self, target_branch: str, force: bool = False) -> Tuple[bool, str]:
+        """Rebase current branch onto target branch."""
+        current_branch = await self.get_current_branch()
+        if not current_branch:
+            return False, "Not on a branch (detached HEAD)"
+        
+        args = ["rebase", target_branch]
+        if force:
+            args.insert(1, "--force-rebase")
+        
+        code, out, err = await self.run_git(*args)
+        
+        if code == 0:
+            return True, f"Rebased {current_branch} onto {target_branch}"
+        else:
+            # Check if it's a conflict that can be resolved
+            if "CONFLICT" in err or "conflict" in err.lower():
+                return False, f"Rebase conflicts detected. Resolve conflicts and run 'git rebase --continue'"
+            return False, f"Rebase failed: {err}"
+    
+    async def merge_branch(self, source_branch: str, force: bool = False) -> Tuple[bool, str]:
+        """Merge source branch into current branch."""
+        current_branch = await self.get_current_branch()
+        if not current_branch:
+            return False, "Not on a branch (detached HEAD)"
+        
+        args = ["merge", source_branch]
+        if force:
+            args.extend(["--strategy-option", "theirs"])
+        
+        code, out, err = await self.run_git(*args)
+        
+        if code == 0:
+            # Check if it was a fast-forward or actual merge
+            if "Fast-forward" in out:
+                return True, f"Fast-forwarded {current_branch} to {source_branch}"
+            else:
+                return True, f"Merged {source_branch} into {current_branch}"
+        else:
+            # Check if it's a conflict that can be resolved
+            if "CONFLICT" in err or "conflict" in err.lower():
+                return False, f"Merge conflicts detected. Resolve conflicts and commit"
+            return False, f"Merge failed: {err}"
+    
+    async def check_sync_safety(self, worktree_path: Optional[str] = None) -> Tuple[bool, List[str]]:
+        """Check if it's safe to perform sync operations (rebase/merge).
+        
+        Returns:
+            Tuple of (is_safe, list_of_issues)
+        """
+        if worktree_path is None:
+            worktree_path = self.repo_root
+        
+        issues = []
+        
+        # Check for uncommitted changes
+        has_changes, change_descriptions = await self.check_uncommitted_changes(worktree_path)
+        if has_changes:
+            issues.extend([f"Uncommitted changes: {desc}" for desc in change_descriptions])
+        
+        # Check for ongoing git operations
+        has_operations, operation_descriptions = await self.check_git_state(worktree_path)
+        if has_operations:
+            issues.extend([f"Ongoing operation: {desc}" for desc in operation_descriptions])
+        
+        return len(issues) == 0, issues
+    
     async def check_uncommitted_changes(self, worktree_path: str) -> Tuple[bool, List[str]]:
         """Check for uncommitted changes in a worktree.
         
@@ -714,10 +811,109 @@ async def cmd_rm(git: GitManager, args) -> int:
 
 
 async def cmd_sync(git: GitManager, args) -> int:
-    """Sync all worktrees with remote."""
+    """Sync current branch from source branch or sync all worktrees."""
     try:
-        print("Syncing worktrees...")
-        success, message = await git.sync_worktrees()
+        source_branch = getattr(args, 'source', None) or getattr(args, 'from_branch', None)
+        use_rebase = getattr(args, 'rebase', False)
+        force = getattr(args, 'force', False)
+        yes = getattr(args, 'yes', False)
+        
+        # If no source branch specified, use old behavior (fetch all)
+        if not source_branch:
+            print("Syncing worktrees...")
+            success, message = await git.sync_worktrees()
+            
+            if success:
+                print(Colors.success(message))
+                return 0
+            else:
+                print(Colors.error(message), file=sys.stderr)
+                return 1
+        
+        # New enhanced sync functionality
+        current_branch = await git.get_current_branch()
+        if not current_branch:
+            print(Colors.error("Not on a branch (detached HEAD)"), file=sys.stderr)
+            return 1
+        
+        # Safety checks unless forced
+        if not force:
+            is_safe, issues = await git.check_sync_safety()
+            if not is_safe:
+                print(Colors.warning(f"Cannot sync branch '{current_branch}' safely:"))
+                for issue in issues:
+                    print(f"  • {issue}")
+                print()
+                print("To proceed anyway, use --force to skip safety checks")
+                print("Or commit/stash your changes first")
+                return 1
+        
+        # Interactive prompting for source branch if not provided
+        if not source_branch:
+            print(f"Syncing branch '{current_branch}'...")
+            
+            # Suggest common base branches
+            base_branch = await git.detect_base_branch()
+            candidates = [base_branch]
+            if base_branch != "origin/main":
+                candidates.append("origin/main")
+            if base_branch != "origin/master":
+                candidates.append("origin/master")
+            if base_branch != "origin/develop":
+                candidates.append("origin/develop")
+            
+            print("Common source branches:")
+            for i, branch in enumerate(candidates, 1):
+                print(f"  {i}. {Colors.colorize(branch, Colors.CYAN)}")
+            print(f"  {len(candidates) + 1}. Other (enter custom)")
+            
+            try:
+                while True:
+                    choice = input(f"Source branch [1-{len(candidates) + 1}]: ").strip()
+                    if not choice:
+                        continue
+                    
+                    try:
+                        index = int(choice) - 1
+                        if 0 <= index < len(candidates):
+                            source_branch = candidates[index]
+                            break
+                        elif index == len(candidates):
+                            source_branch = prompt_input("Source branch")
+                            if source_branch:
+                                break
+                        else:
+                            print(Colors.error(f"Please enter a number between 1 and {len(candidates) + 1}"))
+                    except ValueError:
+                        print(Colors.error("Please enter a valid number"))
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled by user.")
+                return 130
+        
+        # Ask about rebase vs merge if not specified
+        if not hasattr(args, 'rebase'):
+            try:
+                operation = input(f"Operation - (m)erge or (r)ebase? [m]: ").strip().lower()
+                use_rebase = operation in ('r', 'rebase')
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled by user.")
+                return 130
+        
+        # Show what will happen and confirm unless --yes was specified
+        operation_name = "rebase onto" if use_rebase else "merge from"
+        if not yes:
+            try:
+                response = input(f"Will {operation_name} '{source_branch}' into '{current_branch}'. Continue? [y/N]: ")
+                if response.lower() not in ('y', 'yes'):
+                    print("Cancelled.")
+                    return 0
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled by user.")
+                return 130
+        
+        print(f"Syncing {current_branch} from {source_branch} ({'rebase' if use_rebase else 'merge'})...")
+        
+        success, message = await git.sync_branch_from_remote(source_branch, use_rebase, force)
         
         if success:
             print(Colors.success(message))
@@ -727,7 +923,7 @@ async def cmd_sync(git: GitManager, args) -> int:
             return 1
             
     except Exception as e:
-        print(Colors.error(f"Error syncing worktrees: {e}"), file=sys.stderr)
+        print(Colors.error(f"Error syncing: {e}"), file=sys.stderr)
         return 1
 
 
@@ -776,6 +972,9 @@ Examples:
   wt new feat/dashboard      Create new worktree for feature branch
   wt rm feat/dashboard       Remove worktree
   wt sync                    Sync all worktrees with remote
+  wt sync main               Sync current branch from main (merge)
+  wt sync main -r            Sync current branch from main (rebase)
+  wt sync origin/develop -ry Sync from origin/develop, rebase, skip confirmation
         """
     )
     
@@ -801,7 +1000,12 @@ Examples:
     rm_parser.add_argument('--yes', '-y', action='store_true', help='Skip confirmation prompts')
     
     # wt sync
-    sync_parser = subparsers.add_parser('sync', help='Sync worktrees with remote')
+    sync_parser = subparsers.add_parser('sync', help='Sync current branch or all worktrees with remote')
+    sync_parser.add_argument('source', nargs='?', help='Source branch to sync from (will prompt if not provided)')
+    sync_parser.add_argument('--from', dest='from_branch', help='Source branch to sync from (explicit form)')
+    sync_parser.add_argument('--rebase', '-r', action='store_true', help='Rebase instead of merge')
+    sync_parser.add_argument('--force', '-f', action='store_true', help='Skip safety checks')
+    sync_parser.add_argument('--yes', '-y', action='store_true', help='Skip confirmation prompts')
     
     # wt prune
     prune_parser = subparsers.add_parser('prune', help='Prune stale worktree entries')
